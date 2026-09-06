@@ -1,0 +1,4 @@
+.env
+caravan.db
+__pycache__/
+*.pyc

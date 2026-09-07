@@ -2,16 +2,25 @@
 Caravan/train rotation bot for a Last Asylum: Plague alliance.
 
 Manages:
-- A conductor sign-up queue (members list a preferred server time)
-- Live conductor assignment (leadership-only, starts the in-game countdown)
-- A separate VIP rotation, tracked the same way
+- A persistent conductor rotation and a persistent VIP rotation (members join
+  once and stay in rotation forever; being picked doesn't remove them)
+- A once-per-server-day pick: at 00:00 server time, the bot decides whose
+  turn it is (pure fairness — whoever's waited longest, never-gone members
+  first) for both conductor and VIP, and announces it
+- A 30-minutes-before reminder ping for whoever was picked, using their
+  preferred time
+- Leadership-only skip commands, for when someone's already had their turn
+  without the bot knowing (e.g. an out-of-band in-game assignment)
+- Live conductor/VIP assignment (leadership-only manual override)
 - Manual backfill/history logging for turns that already happened
+- Automatic removal from both rotations when a member leaves the Discord server
 - A reusable "how to conduct" instructions command
 
 Leadership-only commands are gated by a Discord role, set via LEADERSHIP_ROLE_NAME below.
 """
 
 import os
+import random
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -35,9 +44,10 @@ HOW_TO_CONDUCT_TEXT = (
     "**How to conduct the caravan:**\n\n"
     "**Step 1 — Sign up with the bot**\n"
     "Run `/join-queue time:HH:MM` with your preferred **server time** (use the in-game server "
-    "clock, not your local time zone — the bot only understands server time). You don't need to "
-    "message leadership yourself: the bot automatically pings Leadership 30 minutes before your "
-    "requested time so they can assign you. That's the only step you need to take ahead of time.\n\n"
+    "clock, not your local time zone — the bot only understands server time). Every server day "
+    "at 00:00, the bot picks whoever's turn it is and announces it, then pings Leadership again "
+    "30 minutes before that person's preferred time so they can assign it in-game. That's the "
+    "only step you need to take ahead of time.\n\n"
     "**Step 2 — Once you're assigned, turn the caravan gold**\n"
     "It costs **25 Alliance Caravan Tickets** to refresh the caravan 5 times, which is "
     "required to turn it gold. You collect tickets by clicking the **gift box** that appears "
@@ -48,8 +58,8 @@ HOW_TO_CONDUCT_TEXT = (
     "to spend some of that time waiting for members to join and collecting their gifted "
     "tickets before you have all 25.\n\n"
     "**Step 4 — Set a VIP**\n"
-    "You can set **one VIP member**, who gets extra rewards. VIP is a rotating spot — the bot "
-    "will tell leadership who's up next when it pings about your run.\n\n"
+    "You can set **one VIP member**, who gets extra rewards. VIP is picked the same way as "
+    "the conductor — the bot announces it at server midnight.\n\n"
     "**Step 5 — Set your defenses**\n"
     "Set all **3 squads** as your defenses.\n\n"
     "**Step 6 — You're done**\n"
@@ -61,24 +71,38 @@ HOW_TO_CONDUCT_TEXT = (
 COMMANDS_TEXT = (
     "**Caravan Bot — Commands**\n\n"
     "**Anyone can use:**\n"
-    "`/join-queue [time]` — sign up for the conductor queue with your preferred server time\n"
-    "`/leave-queue` — remove yourself from the conductor queue\n"
-    "`/queue` — view the current conductor queue\n"
-    "`/join-vip-queue` — sign up for the VIP queue\n"
-    "`/leave-vip-queue` — remove yourself from the VIP queue\n"
-    "`/vip-queue` — view the current VIP queue\n"
+    "`/join-queue time:HH:MM` — join the conductor rotation with your preferred server time (required)\n"
+    "`/leave-queue` — remove yourself from the conductor rotation\n"
+    "`/queue` — view the conductor rotation, soonest-turn first\n"
+    "`/join-vip-queue` — join the VIP rotation\n"
+    "`/leave-vip-queue` — remove yourself from the VIP rotation\n"
+    "`/vip-queue` — view the VIP rotation, soonest-turn first\n"
     "`/history [member]` — view your history, someone else's, or the full roster if left blank\n"
     "`/how-to-conduct` — full instructions for running the caravan\n"
     "`/commands` — show this list\n\n"
     "**Leadership only:**\n"
-    "`/assign-conductor @member` — assign the conductor, starts the countdown immediately\n"
-    "`/assign-vip @member` — assign the VIP for the current run\n"
-    "`/remove-from-queue @member` — remove someone else from the conductor queue\n"
-    "`/remove-from-vip-queue @member` — remove someone else from the VIP queue\n"
+    "`/assign-conductor @member` — manually assign the conductor, overriding today's pick\n"
+    "`/assign-vip @member` — manually assign the VIP, overriding today's pick\n"
+    "`/skip-conductor` — today's conductor already had their turn; pick the next in rotation\n"
+    "`/skip-vip` — today's VIP already had their turn; pick the next in rotation\n"
+    "`/remove-from-queue @member` — remove someone else from the conductor rotation\n"
+    "`/remove-from-vip-queue @member` — remove someone else from the VIP rotation\n"
     "`/remove-member @member` — remove someone from both rotations at once (e.g. they left the alliance)\n"
     "`/log-conductor @member date:YYYY-MM-DD` — backfill a past conductor turn (no countdown)\n"
     "`/log-vip @member date:YYYY-MM-DD` — backfill a past VIP turn"
 )
+
+SKIP_CONDUCTOR_LINES = [
+    "🚨 Leadership says **{old}** already had their turn — skipping them.",
+    "🕵️ Turns out **{old}** already ran the caravan. Moving right along.",
+    "⏭️ **{old}** already had a go, apparently. Next up:",
+]
+
+SKIP_VIP_LINES = [
+    "🚨 Leadership says **{old}** already got the VIP treatment — skipping them.",
+    "🕵️ Turns out **{old}** already had a VIP turn. Moving right along.",
+    "⏭️ **{old}** already had their VIP moment, apparently. Next up:",
+]
 
 intents = discord.Intents.default()
 intents.members = True
@@ -119,84 +143,76 @@ def parse_hhmm(time_str: str):
         return None
 
 
-@tasks.loop(minutes=1)
-async def check_due_conductors():
+async def get_leadership_channel_and_mention():
+    """Returns (channel, role_mention) or (None, None) if not configured/found."""
     if not LEADERSHIP_CHANNEL_ID:
-        return
+        return None, None
     channel = bot.get_channel(int(LEADERSHIP_CHANNEL_ID))
     if channel is None:
         print(f"LEADERSHIP_CHANNEL_ID {LEADERSHIP_CHANNEL_ID} not found or not accessible.")
+        return None, None
+    leadership_role = None
+    if isinstance(channel, discord.TextChannel) and channel.guild:
+        leadership_role = discord.utils.get(channel.guild.roles, name=LEADERSHIP_ROLE_NAME)
+    role_mention = leadership_role.mention if leadership_role else f"@{LEADERSHIP_ROLE_NAME}"
+    return channel, role_mention
+
+
+@tasks.loop(minutes=1)
+async def daily_caravan_check():
+    channel, role_mention = await get_leadership_channel_and_mention()
+    if channel is None:
         return
 
     server_now = game_server_now()
     current_time_str = server_now.strftime("%H:%M")
     today_str = server_now.strftime("%Y-%m-%d")
 
-    pending = db.get_pending_notification_entries()
-    if not pending:
+    # --- Phase 1: at server midnight, decide whose turn it is for the day ---
+    # Selection is pure fairness across the whole rotation — not tied to
+    # anyone's individual preferred time. The preferred time only controls
+    # when the later reminder ping goes out.
+    if current_time_str == "00:00" and db.get_todays_run(today_str) is None:
+        conductor, vip = db.start_daily_run(today_str)
+        if conductor is None:
+            await channel.send(
+                f"{role_mention} — no one is currently in the conductor rotation. "
+                f"Have someone run `/join-queue` to get today's caravan moving."
+            )
+        else:
+            vip_line = f"VIP for today: **{vip['name']}**." if vip else "No one is currently in the VIP rotation."
+            await channel.send(
+                f"{role_mention} — today's conductor is **{conductor['name']}**, scheduled for "
+                f"**{conductor['preferred_time']}** server time. {vip_line}"
+            )
+
+    # --- Phase 2: 30-minutes-before reminder for whoever was already picked ---
+    run = db.get_todays_run(today_str)
+    if run is None or run["conductor_discord_id"] is None or run["reminder_sent_at"]:
         return
 
-    due = []
-    for entry in pending:
-        preferred = parse_hhmm(entry["preferred_time"])
-        if preferred is None:
-            continue
-        # Trigger 30 minutes before the requested time (wraps correctly across midnight).
-        trigger = (preferred - timedelta(minutes=30)).strftime("%H:%M")
-        if trigger != current_time_str:
-            continue
-        # Skip if this entry already fired today (by game-server date) — this is
-        # what lets the same signup repeat day after day without rejoining.
-        if entry["notified_at"] and entry["notified_at"][:10] == today_str:
-            continue
-        due.append(entry)
-    if not due:
+    conductor_entry = db.get_conductor_entry(run["conductor_discord_id"])
+    if conductor_entry is None or conductor_entry["preferred_time"] is None:
+        return
+    preferred = parse_hhmm(conductor_entry["preferred_time"])
+    if preferred is None:
+        return
+    trigger = (preferred - timedelta(minutes=30)).strftime("%H:%M")
+    if trigger != current_time_str:
         return
 
-    leadership_role = None
-    if isinstance(channel, discord.TextChannel) and channel.guild:
-        leadership_role = discord.utils.get(channel.guild.roles, name=LEADERSHIP_ROLE_NAME)
-    role_mention = leadership_role.mention if leadership_role else f"@{LEADERSHIP_ROLE_NAME}"
-
-    # Only one person can actually conduct at a given time. If more than one queue
-    # entry is due for the same trigger (e.g. two members both picked 00:00), pick
-    # whoever has waited longest (never-conducted members first) as the real pick,
-    # ping leadership for just that one, and flag the rest as a conflict instead of
-    # silently sending a separate ping per person.
-    def fairness_key(entry):
-        last = entry["last_conducted_at"]
-        return (last is not None, last or "")
-
-    due.sort(key=fairness_key)
-    chosen, conflicts = due[0], due[1:]
-
-    # Pick the VIP the same way the conductor pick is decided: automatically, off
-    # fairness, from the persistent VIP list — no /assign-vip needed, since
-    # assignment actually happens in-game, not in Discord. Being picked does not
-    # remove anyone from the list; it just updates when they last had a turn.
-    # Exclude today's conductor so they can't end up as their own VIP.
-    next_vip = db.get_next_vip(exclude_discord_id=chosen["discord_id"])
-    if next_vip:
-        vip_line = f"VIP for this run: **{next_vip['name']}**."
-        db.assign_vip(next_vip["discord_id"], next_vip["name"], assigned_by="auto")
-    else:
-        vip_line = "No one is currently in the VIP queue."
+    vip_name = None
+    if run["vip_discord_id"]:
+        vip_row = db.get_member_name(run["vip_discord_id"])
+        vip_name = vip_row["name"] if vip_row else None
+    vip_line = f"VIP for this run: **{vip_name}**." if vip_name else "No one is currently in the VIP rotation."
 
     await channel.send(
-        f"{role_mention} — **{chosen['name']}** is set to run the caravan at "
-        f"**{chosen['preferred_time']}** server time (starting in 30 minutes). "
+        f"{role_mention} — **{conductor_entry['name']}** is set to run the caravan at "
+        f"**{conductor_entry['preferred_time']}** server time (starting in 30 minutes). "
         f"Assign them with `/assign-conductor`.\n{vip_line}"
     )
-    db.mark_conductor_notified(chosen["discord_id"], server_now.isoformat())
-
-    if conflicts:
-        names = ", ".join(f"**{c['name']}**" for c in conflicts)
-        await channel.send(
-            f"⚠️ {names} also requested **{chosen['preferred_time']}** server time, but only "
-            f"one conductor can run at once. **{chosen['name']}** was picked because they've "
-            f"waited longest since their last turn. Ask the others to run `/join-queue` again "
-            f"with a different time."
-        )
+    db.mark_reminder_sent(today_str)
 
 
 @bot.event
@@ -207,72 +223,84 @@ async def on_ready():
         print(f"Synced {len(synced)} commands. Logged in as {bot.user}.")
     except Exception as e:
         print(f"Command sync failed: {e}")
-    if not check_due_conductors.is_running():
-        check_due_conductors.start()
+    if not daily_caravan_check.is_running():
+        daily_caravan_check.start()
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    # Auto-clean both rotations when someone leaves the Discord server, so
+    # leadership never has to manually edit the lists for that.
+    db.leave_conductor_queue(str(member.id))
+    db.leave_vip_queue(str(member.id))
 
 
 # ---------------------------------------------------------------------------
-# Conductor queue (self-service sign-up)
+# Conductor rotation (self-service sign-up, persistent)
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="join-queue", description="Sign up for the conductor rotation with your preferred server time.")
-@app_commands.describe(time="Your preferred server time, e.g. 19:00")
-async def join_queue(interaction: discord.Interaction, time: Optional[str] = None):
+@bot.tree.command(name="join-queue", description="Join the conductor rotation with your preferred server time.")
+@app_commands.describe(time="Your preferred server time, e.g. 19:00 (required)")
+async def join_queue(interaction: discord.Interaction, time: str):
+    if parse_hhmm(time) is None:
+        await interaction.response.send_message(
+            "You need to include a preferred server time in `HH:MM` format (e.g. `19:00`) so the "
+            "bot knows when to remind leadership about your run. Try again, e.g. `/join-queue time:19:00`.",
+            ephemeral=True,
+        )
+        return
     db.join_conductor_queue(str(interaction.user.id), interaction.user.display_name, time)
-    msg = f"You're on the conductor queue"
-    msg += f", preferred time **{time}**." if time else "."
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.response.send_message(
+        f"You're in the conductor rotation, preferred time **{time}**.", ephemeral=True
+    )
 
 
-@bot.tree.command(name="leave-queue", description="Remove yourself from the conductor queue.")
+@bot.tree.command(name="leave-queue", description="Remove yourself from the conductor rotation.")
 async def leave_queue(interaction: discord.Interaction):
     db.leave_conductor_queue(str(interaction.user.id))
-    await interaction.response.send_message("You've been removed from the conductor queue.", ephemeral=True)
+    await interaction.response.send_message("You've been removed from the conductor rotation.", ephemeral=True)
 
 
-@bot.tree.command(name="queue", description="View the current conductor queue.")
+@bot.tree.command(name="queue", description="View the conductor rotation.")
 async def view_queue(interaction: discord.Interaction):
     rows = db.get_conductor_queue()
     if not rows:
-        await interaction.response.send_message("The conductor queue is empty.")
+        await interaction.response.send_message("The conductor rotation is empty.")
         return
-    lines = []
-    for r in rows:
-        time_str = r["preferred_time"] or "no preference"
-        lines.append(f"• **{r['name']}** — {time_str}")
-    await interaction.response.send_message("**Conductor queue:**\n" + "\n".join(lines))
+    lines = [f"• **{r['name']}** — {r['preferred_time']}" for r in rows]
+    await interaction.response.send_message("**Conductor rotation (soonest turn first):**\n" + "\n".join(lines))
 
 
-@bot.tree.command(name="remove-from-queue", description="[Leadership] Remove someone else from the conductor queue.")
-@app_commands.describe(member="The member to remove from the conductor queue")
+@bot.tree.command(name="remove-from-queue", description="[Leadership] Remove someone else from the conductor rotation.")
+@app_commands.describe(member="The member to remove from the conductor rotation")
 @is_leadership()
 async def remove_from_queue(interaction: discord.Interaction, member: discord.Member):
     db.leave_conductor_queue(str(member.id))
-    await interaction.response.send_message(f"**{member.display_name}** has been removed from the conductor queue.", ephemeral=True)
+    await interaction.response.send_message(f"**{member.display_name}** has been removed from the conductor rotation.", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
-# VIP queue (self-service sign-up)
+# VIP rotation (self-service sign-up, persistent)
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="join-vip-queue", description="Sign up for the VIP rotation.")
+@bot.tree.command(name="join-vip-queue", description="Join the VIP rotation.")
 async def join_vip_queue(interaction: discord.Interaction):
     db.join_vip_queue(str(interaction.user.id), interaction.user.display_name)
-    await interaction.response.send_message("You're on the VIP queue.", ephemeral=True)
+    await interaction.response.send_message("You're in the VIP rotation.", ephemeral=True)
 
 
-@bot.tree.command(name="leave-vip-queue", description="Remove yourself from the VIP queue.")
+@bot.tree.command(name="leave-vip-queue", description="Remove yourself from the VIP rotation.")
 async def leave_vip_queue(interaction: discord.Interaction):
     db.leave_vip_queue(str(interaction.user.id))
-    await interaction.response.send_message("You've been removed from the VIP queue.", ephemeral=True)
+    await interaction.response.send_message("You've been removed from the VIP rotation.", ephemeral=True)
 
 
-@bot.tree.command(name="remove-from-vip-queue", description="[Leadership] Remove someone else from the VIP queue.")
-@app_commands.describe(member="The member to remove from the VIP queue")
+@bot.tree.command(name="remove-from-vip-queue", description="[Leadership] Remove someone else from the VIP rotation.")
+@app_commands.describe(member="The member to remove from the VIP rotation")
 @is_leadership()
 async def remove_from_vip_queue(interaction: discord.Interaction, member: discord.Member):
     db.leave_vip_queue(str(member.id))
-    await interaction.response.send_message(f"**{member.display_name}** has been removed from the VIP queue.", ephemeral=True)
+    await interaction.response.send_message(f"**{member.display_name}** has been removed from the VIP rotation.", ephemeral=True)
 
 
 @bot.tree.command(name="remove-member", description="[Leadership] Remove someone from both the conductor and VIP rotations, e.g. if they've left the alliance.")
@@ -287,37 +315,82 @@ async def remove_member(interaction: discord.Interaction, member: discord.Member
     )
 
 
-@bot.tree.command(name="vip-queue", description="View the current VIP queue.")
+@bot.tree.command(name="vip-queue", description="View the VIP rotation.")
 async def view_vip_queue(interaction: discord.Interaction):
     rows = db.get_vip_queue()
     if not rows:
-        await interaction.response.send_message("The VIP queue is empty.")
+        await interaction.response.send_message("The VIP rotation is empty.")
         return
     lines = [f"• **{r['name']}**" for r in rows]
-    await interaction.response.send_message("**VIP queue:**\n" + "\n".join(lines))
+    await interaction.response.send_message("**VIP rotation (soonest turn first):**\n" + "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
-# Leadership: live assignment (starts the countdown in-game)
+# Leadership: live assignment (manual override) and skip
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="assign-conductor", description="[Leadership] Assign a member as conductor. Starts the countdown now.")
+@bot.tree.command(name="assign-conductor", description="[Leadership] Manually assign the conductor, overriding today's pick.")
 @app_commands.describe(member="The member to assign as conductor")
 @is_leadership()
 async def assign_conductor(interaction: discord.Interaction, member: discord.Member):
     db.assign_conductor(str(member.id), member.display_name, str(interaction.user.id))
+    run_day = game_server_now().strftime("%Y-%m-%d")
+    db.record_manual_conductor(run_day, str(member.id))
     await interaction.response.send_message(
         f"🚂 **{member.display_name}** has been assigned as conductor — the countdown starts now!\n"
         f"{member.mention}, here's what to do:\n{HOW_TO_CONDUCT_TEXT}"
     )
 
 
-@bot.tree.command(name="assign-vip", description="[Leadership] Assign a member as VIP for the current train run.")
+@bot.tree.command(name="assign-vip", description="[Leadership] Manually assign the VIP, overriding today's pick.")
 @app_commands.describe(member="The member to assign as VIP")
 @is_leadership()
 async def assign_vip(interaction: discord.Interaction, member: discord.Member):
     db.assign_vip(str(member.id), member.display_name, str(interaction.user.id))
+    run_day = game_server_now().strftime("%Y-%m-%d")
+    db.record_manual_vip(run_day, str(member.id))
     await interaction.response.send_message(f"⭐ **{member.display_name}** has been assigned as VIP for this run.")
+
+
+@bot.tree.command(name="skip-conductor", description="[Leadership] Today's conductor already had their turn — pick the next in rotation.")
+@is_leadership()
+async def skip_conductor_cmd(interaction: discord.Interaction):
+    today_str = game_server_now().strftime("%Y-%m-%d")
+    old_name, new_conductor = db.skip_conductor(today_str)
+    if old_name is None:
+        await interaction.response.send_message("No conductor has been picked for today yet — nothing to skip.", ephemeral=True)
+        return
+    if new_conductor is None:
+        await interaction.response.send_message(
+            f"Tried to skip **{old_name}**, but there's no one else left in the conductor rotation to pick instead.",
+            ephemeral=True,
+        )
+        return
+    line = random.choice(SKIP_CONDUCTOR_LINES).format(old=old_name)
+    await interaction.response.send_message(
+        f"{line}\n🚂 New conductor for today: **{new_conductor['name']}**, scheduled for "
+        f"**{new_conductor['preferred_time']}** server time. VIP stays the same."
+    )
+
+
+@bot.tree.command(name="skip-vip", description="[Leadership] Today's VIP already had their turn — pick the next in rotation.")
+@is_leadership()
+async def skip_vip_cmd(interaction: discord.Interaction):
+    today_str = game_server_now().strftime("%Y-%m-%d")
+    old_name, new_vip = db.skip_vip(today_str)
+    if old_name is None:
+        await interaction.response.send_message("No VIP has been picked for today yet — nothing to skip.", ephemeral=True)
+        return
+    if new_vip is None:
+        await interaction.response.send_message(
+            f"Tried to skip **{old_name}**, but there's no one else left in the VIP rotation to pick instead.",
+            ephemeral=True,
+        )
+        return
+    line = random.choice(SKIP_VIP_LINES).format(old=old_name)
+    await interaction.response.send_message(
+        f"{line}\n⭐ New VIP for today: **{new_vip['name']}**. Conductor stays the same."
+    )
 
 
 # ---------------------------------------------------------------------------

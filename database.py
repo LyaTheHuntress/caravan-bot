@@ -6,6 +6,7 @@ Handles members, the conductor queue, the VIP queue, and the history log.
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 DB_PATH = Path(__file__).parent / "caravan.db"
 
@@ -35,9 +36,15 @@ def init_db():
             discord_id TEXT PRIMARY KEY,
             preferred_time TEXT,
             joined_at TEXT NOT NULL,
+            notified_at TEXT,
             FOREIGN KEY (discord_id) REFERENCES members (discord_id)
         )
     """)
+
+    # Migration: add notified_at to any pre-existing conductor_queue table that predates this column
+    existing_cols = [row["name"] for row in cur.execute("PRAGMA table_info(conductor_queue)").fetchall()]
+    if "notified_at" not in existing_cols:
+        cur.execute("ALTER TABLE conductor_queue ADD COLUMN notified_at TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS vip_queue (
@@ -81,16 +88,17 @@ def ensure_member(discord_id: str, name: str):
 
 # ---------- Conductor queue ----------
 
-def join_conductor_queue(discord_id: str, name: str, preferred_time: str | None):
+def join_conductor_queue(discord_id: str, name: str, preferred_time: Optional[str]):
     ensure_member(discord_id, name)
     conn = get_connection()
     conn.execute(
         """
-        INSERT INTO conductor_queue (discord_id, preferred_time, joined_at)
-        VALUES (?, ?, ?)
+        INSERT INTO conductor_queue (discord_id, preferred_time, joined_at, notified_at)
+        VALUES (?, ?, ?, NULL)
         ON CONFLICT(discord_id) DO UPDATE SET
             preferred_time = excluded.preferred_time,
-            joined_at = excluded.joined_at
+            joined_at = excluded.joined_at,
+            notified_at = NULL
         """,
         (discord_id, preferred_time, now_iso()),
     )
@@ -117,6 +125,71 @@ def get_conductor_queue():
     ).fetchall()
     conn.close()
     return rows
+
+
+def get_due_conductor_entries(current_time_str: str):
+    """Queue entries whose preferred_time matches the given 'HH:MM' string and haven't been notified yet."""
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT cq.discord_id, m.name, cq.preferred_time
+        FROM conductor_queue cq
+        JOIN members m ON m.discord_id = cq.discord_id
+        WHERE cq.preferred_time = ? AND cq.notified_at IS NULL
+        """,
+        (current_time_str,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_pending_notification_entries():
+    """All conductor queue entries that have a preferred_time set.
+    Includes notified_at (for per-day dedupe) and last_conducted_at (fairness tie-break).
+    This list is a persistent rotation — entries are never removed just for having
+    been notified; the caller decides whether today's notification already fired."""
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT cq.discord_id, m.name, cq.preferred_time, cq.notified_at, m.last_conducted_at
+        FROM conductor_queue cq
+        JOIN members m ON m.discord_id = cq.discord_id
+        WHERE cq.preferred_time IS NOT NULL
+        """
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def mark_conductor_notified(discord_id: str, when_iso: Optional[str] = None):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE conductor_queue SET notified_at = ? WHERE discord_id = ?",
+        (when_iso or now_iso(), discord_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_next_vip(exclude_discord_id: Optional[str] = None):
+    """Whoever on the VIP list has waited longest since their last VIP turn
+    (never-VIP members first). Pass exclude_discord_id to skip a specific
+    member (e.g. today's conductor). This list is a persistent rotation —
+    being picked does not remove anyone from it."""
+    conn = get_connection()
+    query = """
+        SELECT vq.discord_id, m.name, m.last_vip_at
+        FROM vip_queue vq
+        JOIN members m ON m.discord_id = vq.discord_id
+    """
+    params = ()
+    if exclude_discord_id:
+        query += " WHERE vq.discord_id != ?"
+        params = (exclude_discord_id,)
+    query += " ORDER BY m.last_vip_at IS NOT NULL, m.last_vip_at ASC"
+    row = conn.execute(query, params).fetchone()
+    conn.close()
+    return row
 
 
 # ---------- VIP queue ----------
@@ -159,6 +232,9 @@ def get_vip_queue():
 # ---------- Assignment (live, starts countdown) ----------
 
 def assign_conductor(discord_id: str, name: str, assigned_by: str):
+    """Record this member as conductor for the current run. They stay on the
+    conductor list with their preferred time — it's a persistent rotation,
+    not a one-time queue, so no one needs to re-join after their turn."""
     ensure_member(discord_id, name)
     ts = now_iso()
     conn = get_connection()
@@ -166,7 +242,10 @@ def assign_conductor(discord_id: str, name: str, assigned_by: str):
         "UPDATE members SET last_conducted_at = ? WHERE discord_id = ?",
         (ts, discord_id),
     )
-    conn.execute("DELETE FROM conductor_queue WHERE discord_id = ?", (discord_id,))
+    conn.execute(
+        "UPDATE conductor_queue SET notified_at = ? WHERE discord_id = ?",
+        (ts, discord_id),
+    )
     conn.execute(
         """
         INSERT INTO assignment_log (discord_id, role, timestamp, assigned_by, is_backfill)
@@ -180,6 +259,9 @@ def assign_conductor(discord_id: str, name: str, assigned_by: str):
 
 
 def assign_vip(discord_id: str, name: str, assigned_by: str):
+    """Record this member as VIP for the current run. They stay on the VIP
+    list — it's a persistent rotation, not a one-time queue, so no one needs
+    to re-join after their turn."""
     ensure_member(discord_id, name)
     ts = now_iso()
     conn = get_connection()
@@ -187,7 +269,6 @@ def assign_vip(discord_id: str, name: str, assigned_by: str):
         "UPDATE members SET last_vip_at = ? WHERE discord_id = ?",
         (ts, discord_id),
     )
-    conn.execute("DELETE FROM vip_queue WHERE discord_id = ?", (discord_id,))
     conn.execute(
         """
         INSERT INTO assignment_log (discord_id, role, timestamp, assigned_by, is_backfill)

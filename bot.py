@@ -303,7 +303,7 @@ async def remove_from_vip_queue(interaction: discord.Interaction, member: discor
     await interaction.response.send_message(f"**{member.display_name}** has been removed from the VIP rotation.", ephemeral=True)
 
 
-@bot.tree.command(name="remove-member", description="[Leadership] Remove someone from both the conductor and VIP rotations, e.g. if they've left the alliance.")
+@bot.tree.command(name="remove-member", description="[Leadership] Remove someone from both rotations at once (e.g. they left the alliance).")
 @app_commands.describe(member="The member to remove from both rotations")
 @is_leadership()
 async def remove_member(interaction: discord.Interaction, member: discord.Member):

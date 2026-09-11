@@ -2,3 +2,12 @@
 caravan.db
 __pycache__/
 *.pyc
+
+# SSH keys should never live in this folder in the first place (see
+# SETUP_GUIDE.md), but this is a backstop in case one ever ends up here.
+*.key
+*.pem
+
+# Common OS/editor clutter
+.DS_Store
+.vscode/

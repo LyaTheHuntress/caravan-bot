@@ -59,7 +59,14 @@ HOW_TO_CONDUCT_TEXT = (
     "tickets before you have all 25.\n\n"
     "**Step 4 — Set a VIP**\n"
     "You can set **one VIP member**, who gets extra rewards. VIP is picked the same way as "
-    "the conductor — the bot announces it at server midnight.\n\n"
+    "the conductor — the bot announces it at server midnight. A few things about how it works "
+    "in-game: sending the invite starts a countdown (defaults to 60 minutes if they're offline, "
+    "shorter if they're online) — if they don't accept in time, the invite opens back up so you "
+    "can pick someone else. VIP and Guard are mutually exclusive; you can only assign one or the "
+    "other, not both. Once the VIP accepts, it's the **conductor** who picks which 2 of the 4 "
+    "wagon slots their rewards come from — not the VIP. If the picked VIP doesn't accept and "
+    "you don't want to wait, leadership can run `/skip-vip` to move on to the next person in "
+    "rotation.\n\n"
     "**Step 5 — Set your defenses**\n"
     "Set all **3 squads** as your defenses.\n\n"
     "**Step 6 — You're done**\n"
@@ -180,9 +187,10 @@ async def daily_caravan_check():
                 f"Have someone run `/join-queue` to get today's caravan moving."
             )
         else:
-            vip_line = f"VIP for today: **{vip['name']}**." if vip else "No one is currently in the VIP rotation."
+            conductor_mention = f"<@{conductor['discord_id']}>"
+            vip_line = f"VIP for today: <@{vip['discord_id']}>." if vip else "No one is currently in the VIP rotation."
             await channel.send(
-                f"{role_mention} — today's conductor is **{conductor['name']}**, scheduled for "
+                f"{role_mention} — today's conductor is {conductor_mention}, scheduled for "
                 f"**{conductor['preferred_time']}** server time. {vip_line}"
             )
 
@@ -201,16 +209,11 @@ async def daily_caravan_check():
     if trigger != current_time_str:
         return
 
-    vip_name = None
-    if run["vip_discord_id"]:
-        vip_row = db.get_member_name(run["vip_discord_id"])
-        vip_name = vip_row["name"] if vip_row else None
-    vip_line = f"VIP for this run: **{vip_name}**." if vip_name else "No one is currently in the VIP rotation."
+    vip_line = f"VIP for this run: <@{run['vip_discord_id']}>." if run["vip_discord_id"] else "No one is currently in the VIP rotation."
 
     await channel.send(
-        f"{role_mention} — **{conductor_entry['name']}** is set to run the caravan at "
-        f"**{conductor_entry['preferred_time']}** server time (starting in 30 minutes). "
-        f"Assign them with `/assign-conductor`.\n{vip_line}"
+        f"{role_mention} — <@{run['conductor_discord_id']}> is set to run the caravan at "
+        f"**{conductor_entry['preferred_time']}** server time (starting in 30 minutes).\n{vip_line}"
     )
     db.mark_reminder_sent(today_str)
 

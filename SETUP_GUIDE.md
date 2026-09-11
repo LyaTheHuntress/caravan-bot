@@ -74,7 +74,7 @@ More steps, but genuinely free with no time limit. Windows works fine — you'll
 2. In the Oracle console, create a **Compute Instance**:
    - Choose an "Always Free eligible" shape (e.g. VM.Standard.E2.1.Micro or the Ampere ARM free shape)
    - Choose Ubuntu as the OS image
-   - When prompted, download the SSH key pair Oracle generates — save it somewhere safe, you'll need it to connect
+   - When prompted, download the SSH key pair Oracle generates. **Save it outside your `caravan-bot` folder** — e.g. in a dedicated `Documents\ssh-keys\` folder, not inside the git repo. If it ends up in the repo folder and you ever run `git add .` instead of adding specific files, this key could get pushed to GitHub — and since it's what grants SSH access to your server, that would let anyone with the repo link log into your machine. Once your key is saved, you'll reference its full path (not just the filename) in the `ssh -i` command below, so where it lives doesn't have to match your repo folder at all.
 3. Configure networking: in the instance's **Virtual Cloud Network → Security Lists**, you generally don't need to open extra ports for a Discord bot (it only makes outbound connections), so default settings usually work — this step trips people up but for this specific bot there's little to configure
 4. Connect from Windows:
    - Open **Terminal** (Windows 10/11 has SSH built in) or use PuTTY with your downloaded key
@@ -93,6 +93,16 @@ More steps, but genuinely free with no time limit. Windows works fine — you'll
    nano .env
    ```
    (edit the values, then Ctrl+X, Y, Enter to save)
+
+   **Important — set `GAME_SERVER_UTC_OFFSET` for your own game/server.** This bot uses it to know
+   what "server time" means for the daily 00:00 pick and the 30-minute reminder, and it's almost
+   certainly different from the value in this repo's example — different games run on different
+   server times, and even within one game, different servers can be on different offsets. To find
+   yours: open your game and compare its in-game clock to the current real-world UTC time (search
+   "UTC time now" for a reference). If your game's clock reads 2 hours behind UTC, set this to
+   `-2`; if it's 8 hours ahead, set it to `8`. Also check whether your real-world region observes
+   Daylight Saving Time while your game server doesn't (or vice versa) — if so, you may need to
+   update this value twice a year.
 7. Keep the bot running permanently even after you disconnect, using `screen`:
    ```
    sudo apt install screen -y
@@ -112,4 +122,5 @@ More steps, but genuinely free with no time limit. Windows works fine — you'll
 
 ## Phase 7 (later, whenever you're ready): backfill your existing records
 
-Use `/log-conductor @member date:YYYY-MM-DD` and `/log-vip @member date:YYYY-MM-DD` to enter your existing manually-tracked history, so the fairness view (`/history`) is accurate from day one. If you'd rather not do this one-by-one for everyone, send me your current list and I can write a one-time bulk import.
+Use `/log-conductor @member date:YYYY-MM-DD` and `/log-vip @member date:YYYY-MM-DD` to enter your existing manually-tracked history, so the fairness view (`/history`) is accurate from day one.
+ 

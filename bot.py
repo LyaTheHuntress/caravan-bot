@@ -464,14 +464,38 @@ async def history(interaction: discord.Interaction, member: Optional[discord.Mem
 # Instructions
 # ---------------------------------------------------------------------------
 
+def chunk_text(text: str, limit: int = 1900):
+    """Splits text into pieces under Discord's 2000-char message limit,
+    breaking on paragraph boundaries (\\n\\n) so steps don't get cut mid-sentence."""
+    parts = text.split("\n\n")
+    chunks = []
+    current = ""
+    for part in parts:
+        candidate = f"{current}\n\n{part}" if current else part
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = part
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 @bot.tree.command(name="how-to-conduct", description="Show the full steps for conducting the caravan.")
 async def how_to_conduct(interaction: discord.Interaction):
-    await interaction.response.send_message(HOW_TO_CONDUCT_TEXT)
+    chunks = chunk_text(HOW_TO_CONDUCT_TEXT)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
 
 
 @bot.tree.command(name="commands", description="List all bot commands.")
 async def list_commands(interaction: discord.Interaction):
-    await interaction.response.send_message(COMMANDS_TEXT, ephemeral=True)
+    chunks = chunk_text(COMMANDS_TEXT)
+    await interaction.response.send_message(chunks[0], ephemeral=True)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=True)
 
 
 if __name__ == "__main__":

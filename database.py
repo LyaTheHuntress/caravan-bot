@@ -60,21 +60,30 @@ def init_db():
     # this is a single global lock keyed by day, not per queue entry.
     # notified_at = when today's picks were selected/announced (00:00 kickoff,
     # or a manual /assign-conductor / /assign-vip override).
-    # reminder_sent_at = when the 30-minutes-before ping fired for today's
-    # conductor. Reset to NULL whenever the conductor changes (e.g. via skip)
-    # so a fresh reminder goes out for the new pick.
+    # remind_at = the exact moment (ISO, server-local) the 30-minutes-before
+    # reminder should fire, computed once when the conductor is picked. Using
+    # an absolute timestamp (rather than matching HH:MM strings each minute)
+    # is what lets this correctly handle someone scheduled in the first 30
+    # minutes after midnight, where the naive "30 min before" clock time
+    # wraps into the previous day.
+    # reminder_sent_at = when the reminder actually fired. Reset to NULL
+    # whenever the conductor changes (e.g. via skip) so a fresh reminder
+    # goes out for the new pick.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_run (
             server_date TEXT PRIMARY KEY,
             conductor_discord_id TEXT,
             vip_discord_id TEXT,
             notified_at TEXT,
-            reminder_sent_at TEXT
+            reminder_sent_at TEXT,
+            remind_at TEXT
         )
     """)
     existing_daily_run_cols = [row["name"] for row in cur.execute("PRAGMA table_info(daily_run)").fetchall()]
     if "reminder_sent_at" not in existing_daily_run_cols:
         cur.execute("ALTER TABLE daily_run ADD COLUMN reminder_sent_at TEXT")
+    if "remind_at" not in existing_daily_run_cols:
+        cur.execute("ALTER TABLE daily_run ADD COLUMN remind_at TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS assignment_log (
@@ -143,6 +152,23 @@ def leave_conductor_queue(discord_id: str):
     conn.close()
 
 
+def set_conductor_time(discord_id: str, preferred_time: str) -> bool:
+    """Leadership override: change an existing conductor-rotation member's
+    preferred time without resetting their joined_at (and therefore without
+    disturbing their tie-break position in the fairness order). Returns
+    False if they're not currently in the rotation — this only edits an
+    existing entry, it doesn't add someone new."""
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE conductor_queue SET preferred_time = ? WHERE discord_id = ?",
+        (preferred_time, discord_id),
+    )
+    changed = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
 def get_conductor_queue():
     conn = get_connection()
     rows = conn.execute(
@@ -150,7 +176,7 @@ def get_conductor_queue():
         SELECT cq.discord_id, m.name, cq.preferred_time, cq.joined_at, m.last_conducted_at
         FROM conductor_queue cq
         JOIN members m ON m.discord_id = cq.discord_id
-        ORDER BY m.last_conducted_at IS NOT NULL, m.last_conducted_at ASC
+        ORDER BY m.last_conducted_at IS NOT NULL, m.last_conducted_at ASC, cq.joined_at ASC
         """
     ).fetchall()
     conn.close()
@@ -175,8 +201,10 @@ def get_conductor_entry(discord_id: str):
 
 def get_next_conductor(exclude_ids: Optional[Sequence[str]] = None):
     """Fairness pick from the persistent conductor list: whoever hasn't
-    conducted longest (never-conducted members first). Being picked does not
-    remove anyone from the list."""
+    conducted longest (never-conducted members first). Ties (e.g. multiple
+    members who've never conducted) break by who joined the rotation
+    earliest, so a brand-new signup can't leapfrog someone who's been
+    waiting longer. Being picked does not remove anyone from the list."""
     conn = get_connection()
     where, params = _exclude_clause(exclude_ids, "cq")
     query = f"""
@@ -184,7 +212,7 @@ def get_next_conductor(exclude_ids: Optional[Sequence[str]] = None):
         FROM conductor_queue cq
         JOIN members m ON m.discord_id = cq.discord_id
         {where}
-        ORDER BY m.last_conducted_at IS NOT NULL, m.last_conducted_at ASC
+        ORDER BY m.last_conducted_at IS NOT NULL, m.last_conducted_at ASC, cq.joined_at ASC
     """
     row = conn.execute(query, params).fetchone()
     conn.close()
@@ -221,7 +249,7 @@ def get_vip_queue():
         SELECT vq.discord_id, m.name, vq.joined_at, m.last_vip_at
         FROM vip_queue vq
         JOIN members m ON m.discord_id = vq.discord_id
-        ORDER BY m.last_vip_at IS NOT NULL, m.last_vip_at ASC
+        ORDER BY m.last_vip_at IS NOT NULL, m.last_vip_at ASC, vq.joined_at ASC
         """
     ).fetchall()
     conn.close()
@@ -230,9 +258,10 @@ def get_vip_queue():
 
 def get_next_vip(exclude_ids: Optional[Sequence[str]] = None):
     """Fairness pick from the persistent VIP list: whoever hasn't been VIP
-    longest (never-VIP members first). Pass exclude_ids to skip specific
-    members (e.g. today's conductor). Being picked does not remove anyone
-    from the list."""
+    longest (never-VIP members first). Ties break by who joined the rotation
+    earliest, same reasoning as get_next_conductor. Pass exclude_ids to skip
+    specific members (e.g. today's conductor). Being picked does not remove
+    anyone from the list."""
     conn = get_connection()
     where, params = _exclude_clause(exclude_ids, "vq")
     query = f"""
@@ -240,7 +269,7 @@ def get_next_vip(exclude_ids: Optional[Sequence[str]] = None):
         FROM vip_queue vq
         JOIN members m ON m.discord_id = vq.discord_id
         {where}
-        ORDER BY m.last_vip_at IS NOT NULL, m.last_vip_at ASC
+        ORDER BY m.last_vip_at IS NOT NULL, m.last_vip_at ASC, vq.joined_at ASC
     """
     row = conn.execute(query, params).fetchone()
     conn.close()
@@ -354,6 +383,18 @@ def mark_reminder_sent(server_date: str):
     conn.execute(
         "UPDATE daily_run SET reminder_sent_at = ? WHERE server_date = ?",
         (now_iso(), server_date),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_remind_at(server_date: str, remind_at_iso: str):
+    """Stores the exact moment (ISO, server-local) the 30-minutes-before
+    reminder should fire for today's run."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE daily_run SET remind_at = ? WHERE server_date = ?",
+        (remind_at_iso, server_date),
     )
     conn.commit()
     conn.close()

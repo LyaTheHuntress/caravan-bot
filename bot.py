@@ -92,6 +92,7 @@ COMMANDS_TEXT = (
     "`/assign-vip @member` — manually assign the VIP, overriding today's pick\n"
     "`/skip-conductor` — today's conductor already had their turn; pick the next in rotation\n"
     "`/skip-vip` — today's VIP already had their turn; pick the next in rotation\n"
+    "`/set-time @member time:HH:MM` — change a member's preferred conductor time\n"
     "`/remove-from-queue @member` — remove someone else from the conductor rotation\n"
     "`/remove-from-vip-queue @member` — remove someone else from the VIP rotation\n"
     "`/remove-member @member` — remove someone from both rotations at once (e.g. they left the alliance)\n"
@@ -165,6 +166,17 @@ async def get_leadership_channel_and_mention():
     return channel, role_mention
 
 
+def compute_remind_at(pick_moment: datetime, preferred_time_str: str):
+    """Combines the calendar day of pick_moment with preferred_time_str's
+    HH:MM to get the actual datetime of the run, then subtracts 30 minutes.
+    Returns None if preferred_time_str doesn't parse."""
+    preferred = parse_hhmm(preferred_time_str)
+    if preferred is None:
+        return None
+    run_dt = pick_moment.replace(hour=preferred.hour, minute=preferred.minute, second=0, microsecond=0)
+    return run_dt - timedelta(minutes=30)
+
+
 @tasks.loop(minutes=1)
 async def daily_caravan_check():
     channel, role_mention = await get_leadership_channel_and_mention()
@@ -193,20 +205,33 @@ async def daily_caravan_check():
                 f"{role_mention} — today's conductor is {conductor_mention}, scheduled for "
                 f"**{conductor['preferred_time']}** server time. {vip_line}"
             )
+            # Compute the exact moment the 30-min reminder should fire. If that
+            # moment has already passed — e.g. someone's preferred time is within
+            # the first 30 minutes after midnight, so the window closed before
+            # we even finished picking — send it right now instead of waiting
+            # for the same clock time to roll around again almost 24 hours later.
+            remind_at = compute_remind_at(server_now, conductor["preferred_time"])
+            if remind_at is not None:
+                db.set_remind_at(today_str, remind_at.isoformat())
+                if remind_at <= server_now:
+                    await channel.send(
+                        f"{role_mention} — <@{conductor['discord_id']}> is set to run the caravan at "
+                        f"**{conductor['preferred_time']}** server time (starting very soon — their "
+                        f"reminder window already passed by the time they were picked).\n{vip_line}"
+                    )
+                    db.mark_reminder_sent(today_str)
 
     # --- Phase 2: 30-minutes-before reminder for whoever was already picked ---
     run = db.get_todays_run(today_str)
     if run is None or run["conductor_discord_id"] is None or run["reminder_sent_at"]:
         return
+    if not run["remind_at"]:
+        return
+    if server_now < datetime.fromisoformat(run["remind_at"]):
+        return
 
     conductor_entry = db.get_conductor_entry(run["conductor_discord_id"])
-    if conductor_entry is None or conductor_entry["preferred_time"] is None:
-        return
-    preferred = parse_hhmm(conductor_entry["preferred_time"])
-    if preferred is None:
-        return
-    trigger = (preferred - timedelta(minutes=30)).strftime("%H:%M")
-    if trigger != current_time_str:
+    if conductor_entry is None:
         return
 
     vip_line = f"VIP for this run: <@{run['vip_discord_id']}>." if run["vip_discord_id"] else "No one is currently in the VIP rotation."
@@ -280,6 +305,28 @@ async def view_queue(interaction: discord.Interaction):
 async def remove_from_queue(interaction: discord.Interaction, member: discord.Member):
     db.leave_conductor_queue(str(member.id))
     await interaction.response.send_message(f"**{member.display_name}** has been removed from the conductor rotation.", ephemeral=True)
+
+
+@bot.tree.command(name="set-time", description="[Leadership] Change a member's preferred conductor time.")
+@app_commands.describe(member="The member whose time to change", time="Their new preferred server time, e.g. 19:00")
+@is_leadership()
+async def set_time(interaction: discord.Interaction, member: discord.Member, time: str):
+    if parse_hhmm(time) is None:
+        await interaction.response.send_message(
+            "Please use `HH:MM` format, e.g. `19:00`.", ephemeral=True
+        )
+        return
+    changed = db.set_conductor_time(str(member.id), time)
+    if not changed:
+        await interaction.response.send_message(
+            f"**{member.display_name}** isn't currently in the conductor rotation, so there's no time to change. "
+            f"They'll need to run `/join-queue` themselves first.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        f"**{member.display_name}**'s preferred time is now **{time}**.", ephemeral=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +416,9 @@ async def skip_conductor_cmd(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
+    remind_at = compute_remind_at(game_server_now(), new_conductor["preferred_time"])
+    if remind_at is not None:
+        db.set_remind_at(today_str, remind_at.isoformat())
     line = random.choice(SKIP_CONDUCTOR_LINES).format(old=old_name)
     await interaction.response.send_message(
         f"{line}\n🚂 New conductor for today: **{new_conductor['name']}**, scheduled for "

@@ -21,6 +21,7 @@ Leadership-only commands are gated by a Discord role, set via LEADERSHIP_ROLE_NA
 
 import os
 import random
+import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -39,6 +40,10 @@ LEADERSHIP_CHANNEL_ID = os.getenv("LEADERSHIP_CHANNEL_ID")
 # Hours to add to UTC to get the game's server time. Adjust if your game's server time
 # doesn't match UTC. E.g. if game server time is UTC+8, set GAME_SERVER_UTC_OFFSET=8.
 GAME_SERVER_UTC_OFFSET = float(os.getenv("GAME_SERVER_UTC_OFFSET", "0"))
+# Optional: a link to wherever your alliance keeps its time-zone conversion chart
+# (a channel, pinned message, spreadsheet, etc.). If set, it gets included in the
+# /ping-for-times DM so people don't have to go hunting for it.
+TIME_CONVERSION_CHART_URL = os.getenv("TIME_CONVERSION_CHART_URL", "")
 
 HOW_TO_CONDUCT_TEXT = (
     "**How to conduct the caravan:**\n\n"
@@ -93,6 +98,10 @@ COMMANDS_TEXT = (
     "`/skip-conductor` — today's conductor already had their turn; pick the next in rotation\n"
     "`/skip-vip` — today's VIP already had their turn; pick the next in rotation\n"
     "`/set-time @member time:HH:MM` — add a member to the conductor rotation, or change their time if they're already in it\n"
+    "`/add-vip @member` — add a member to the VIP rotation\n"
+    "`/add-all-to-vip` — add every server member to the VIP rotation at once\n"
+    "`/sync-names` — refresh everyone's stored name to their current server nickname\n"
+    "`/ping-for-times` — DM everyone not in the conductor rotation, asking for their time\n"
     "`/remove-from-queue @member` — remove someone else from the conductor rotation\n"
     "`/remove-from-vip-queue @member` — remove someone else from the VIP rotation\n"
     "`/remove-member @member` — remove someone from both rotations at once (e.g. they left the alliance)\n"
@@ -114,6 +123,12 @@ SKIP_VIP_LINES = [
 
 intents = discord.Intents.default()
 intents.members = True
+# Needed to read the actual text of DM replies for the /ping-for-times onboarding
+# flow below. This must ALSO be turned on in the Discord Developer Portal under
+# Bot -> Privileged Gateway Intents -> Message Content Intent, the same way
+# Server Members Intent was enabled during initial setup — the code-side flag
+# alone isn't enough.
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -263,6 +278,61 @@ async def on_member_remove(member: discord.Member):
     db.leave_vip_queue(str(member.id))
 
 
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Keeps the stored name in sync automatically whenever someone's server
+    # nickname (or, as a fallback, their username) changes — no need to wait
+    # for them to run another command for it to take effect.
+    if before.display_name != after.display_name:
+        db.ensure_member(str(after.id), after.display_name)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+    # VIP needs no time input, so new members go straight into that rotation.
+    db.join_vip_queue(str(member.id), member.display_name)
+    # Conductor needs their own preferred time, so this is an invite to
+    # provide one (by DM reply or /join-queue), not an automatic add.
+    try:
+        await member.send(build_time_request_dm(welcome=True))
+        db.mark_pending_onboarding(str(member.id))
+    except discord.Forbidden:
+        pass  # their DMs are closed to the bot; they can still self-join with /join-queue
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Only handle direct messages here (message.guild is None for DMs) — this
+    # bot has no other use for on_message, and all its real commands are slash
+    # commands, which this doesn't interfere with.
+    if message.guild is not None or message.author.bot:
+        return
+
+    discord_id = str(message.author.id)
+    if not db.is_pending_onboarding(discord_id):
+        await message.channel.send(
+            "I wasn't expecting a reply from you, but if you'd like to join the conductor "
+            "rotation, run `/join-queue time:HH:MM` in the server."
+        )
+        return
+
+    time_str = message.content.strip()
+    if parse_hhmm(time_str) is None:
+        await message.channel.send(
+            "That doesn't look like a time — please reply with `HH:MM` in 24-hour server "
+            "time, e.g. `19:00`."
+        )
+        return
+
+    db.join_conductor_queue(discord_id, message.author.display_name, time_str)
+    db.clear_pending_onboarding(discord_id)
+    await message.channel.send(
+        f"Got it — you're in the conductor rotation with preferred time **{time_str}**. Thanks!"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Conductor rotation (self-service sign-up, persistent)
 # ---------------------------------------------------------------------------
@@ -337,6 +407,111 @@ async def set_time(interaction: discord.Interaction, member: discord.Member, tim
 async def join_vip_queue(interaction: discord.Interaction):
     db.join_vip_queue(str(interaction.user.id), interaction.user.display_name)
     await interaction.response.send_message("You're in the VIP rotation.", ephemeral=True)
+
+
+@bot.tree.command(name="add-vip", description="[Leadership] Add a member to the VIP rotation.")
+@app_commands.describe(member="The member to add to the VIP rotation")
+@is_leadership()
+async def add_vip(interaction: discord.Interaction, member: discord.Member):
+    if db.is_in_vip_queue(str(member.id)):
+        await interaction.response.send_message(
+            f"**{member.display_name}** is already in the VIP rotation.", ephemeral=True
+        )
+        return
+    db.join_vip_queue(str(member.id), member.display_name)
+    await interaction.response.send_message(
+        f"**{member.display_name}** has been added to the VIP rotation.", ephemeral=True
+    )
+
+
+@bot.tree.command(name="add-all-to-vip", description="[Leadership] Add every server member to the VIP rotation at once.")
+@is_leadership()
+async def add_all_to_vip(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This only works inside a server.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    added, already = 0, 0
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        if db.is_in_vip_queue(str(member.id)):
+            already += 1
+            continue
+        db.join_vip_queue(str(member.id), member.display_name)
+        added += 1
+
+    await interaction.followup.send(
+        f"Added {added} member(s) to the VIP rotation. {already} were already in it.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="sync-names", description="[Leadership] Refresh everyone's stored name to their current server nickname.")
+@is_leadership()
+async def sync_names(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This only works inside a server.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    updated = 0
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        db.ensure_member(str(member.id), member.display_name)
+        updated += 1
+
+    await interaction.followup.send(f"Refreshed names for {updated} member(s).", ephemeral=True)
+
+
+def build_time_request_dm(welcome: bool) -> str:
+    """DM text asking someone for their preferred conductor time. Shared
+    between the on-join greeting and the bulk /ping-for-times sweep so the
+    wording (and conversion-chart link) stays consistent between them."""
+    chart_line = f" Conversion chart: {TIME_CONVERSION_CHART_URL}" if TIME_CONVERSION_CHART_URL else ""
+    intro = (
+        "Welcome to the alliance! We use a bot to fairly rotate who runs the Alliance Caravan each day."
+        if welcome else
+        "Hi! Your alliance is using a bot to fairly rotate who runs the Alliance Caravan each day."
+    )
+    return (
+        f"{intro} What's your preferred **server time** to conduct? Reply "
+        "here with a time in `HH:MM` (24-hour, server time — check the conversion "
+        f"chart if you're not sure) and I'll add you to the rotation automatically.{chart_line} "
+        "You can also do this yourself anytime with `/join-queue time:HH:MM` in the server."
+    )
+
+
+@bot.tree.command(name="ping-for-times", description="[Leadership] DM everyone not in the conductor rotation, asking for their time.")
+@is_leadership()
+async def ping_for_times(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This only works inside a server.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    conductor_ids = db.get_conductor_ids()
+    to_ping = [m for m in interaction.guild.members if not m.bot and str(m.id) not in conductor_ids]
+    dm_text = build_time_request_dm(welcome=False)
+
+    sent, failed = [], []
+    for member in to_ping:
+        try:
+            await member.send(dm_text)
+            db.mark_pending_onboarding(str(member.id))
+            sent.append(member.display_name)
+        except discord.Forbidden:
+            failed.append(member.display_name)
+        await asyncio.sleep(1)
+
+    msg = f"Sent to {len(sent)} member(s)."
+    if failed:
+        shown = ", ".join(failed[:20])
+        more = f", and {len(failed) - 20} more" if len(failed) > 20 else ""
+        msg += f" Couldn't DM {len(failed)} (their DMs are likely closed to this bot): {shown}{more}"
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name="leave-vip-queue", description="Remove yourself from the VIP rotation.")

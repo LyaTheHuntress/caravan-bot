@@ -96,6 +96,17 @@ def init_db():
         )
     """)
 
+    # Tracks members who've been DM'd asking for their preferred conductor
+    # time and haven't replied with a valid one yet. When they DM the bot
+    # back, on_message checks this table to know whether to treat their
+    # message as a time-onboarding answer.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_onboarding (
+            discord_id TEXT PRIMARY KEY,
+            prompted_at TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -231,6 +242,51 @@ def join_vip_queue(discord_id: str, name: str):
         """,
         (discord_id, now_iso()),
     )
+    conn.commit()
+    conn.close()
+
+
+def is_in_vip_queue(discord_id: str) -> bool:
+    """Checks membership without touching joined_at, so a leadership add
+    command can tell 'already in' from 'needs adding' without accidentally
+    resetting an existing member's position via join_vip_queue's upsert."""
+    conn = get_connection()
+    row = conn.execute("SELECT 1 FROM vip_queue WHERE discord_id = ?", (discord_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_conductor_ids():
+    """The set of discord_id strings currently in the conductor rotation."""
+    conn = get_connection()
+    rows = conn.execute("SELECT discord_id FROM conductor_queue").fetchall()
+    conn.close()
+    return {row["discord_id"] for row in rows}
+
+
+def mark_pending_onboarding(discord_id: str):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO pending_onboarding (discord_id, prompted_at) VALUES (?, ?)
+        ON CONFLICT(discord_id) DO UPDATE SET prompted_at = excluded.prompted_at
+        """,
+        (discord_id, now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_pending_onboarding(discord_id: str) -> bool:
+    conn = get_connection()
+    row = conn.execute("SELECT 1 FROM pending_onboarding WHERE discord_id = ?", (discord_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def clear_pending_onboarding(discord_id: str):
+    conn = get_connection()
+    conn.execute("DELETE FROM pending_onboarding WHERE discord_id = ?", (discord_id,))
     conn.commit()
     conn.close()
 

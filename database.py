@@ -69,6 +69,15 @@ def init_db():
     # reminder_sent_at = when the reminder actually fired. Reset to NULL
     # whenever the conductor changes (e.g. via skip) so a fresh reminder
     # goes out for the new pick.
+    # conductor_prev_last_conducted_at / vip_prev_last_vip_at = whatever the
+    # CURRENTLY credited pick's last_conducted_at / last_vip_at was right
+    # before they were credited for today. If leadership then overrides that
+    # pick with someone else via /assign-conductor or /assign-vip, this is
+    # what gets restored to the person being replaced — since they never
+    # actually went, they shouldn't lose their place in the fairness order.
+    # (/skip-conductor and /skip-vip are different: they mean "this person
+    # really did already go, just not through the bot," so they deliberately
+    # do NOT restore the outgoing person's value.)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_run (
             server_date TEXT PRIMARY KEY,
@@ -76,7 +85,9 @@ def init_db():
             vip_discord_id TEXT,
             notified_at TEXT,
             reminder_sent_at TEXT,
-            remind_at TEXT
+            remind_at TEXT,
+            conductor_prev_last_conducted_at TEXT,
+            vip_prev_last_vip_at TEXT
         )
     """)
     existing_daily_run_cols = [row["name"] for row in cur.execute("PRAGMA table_info(daily_run)").fetchall()]
@@ -84,6 +95,10 @@ def init_db():
         cur.execute("ALTER TABLE daily_run ADD COLUMN reminder_sent_at TEXT")
     if "remind_at" not in existing_daily_run_cols:
         cur.execute("ALTER TABLE daily_run ADD COLUMN remind_at TEXT")
+    if "conductor_prev_last_conducted_at" not in existing_daily_run_cols:
+        cur.execute("ALTER TABLE daily_run ADD COLUMN conductor_prev_last_conducted_at TEXT")
+    if "vip_prev_last_vip_at" not in existing_daily_run_cols:
+        cur.execute("ALTER TABLE daily_run ADD COLUMN vip_prev_last_vip_at TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS assignment_log (
@@ -381,57 +396,171 @@ def start_daily_run(server_date: str):
         )
     conn.execute(
         """
-        INSERT INTO daily_run (server_date, conductor_discord_id, vip_discord_id, notified_at, reminder_sent_at)
-        VALUES (?, ?, ?, ?, NULL)
+        INSERT INTO daily_run (server_date, conductor_discord_id, vip_discord_id, notified_at, reminder_sent_at,
+                                conductor_prev_last_conducted_at, vip_prev_last_vip_at)
+        VALUES (?, ?, ?, ?, NULL, ?, ?)
         ON CONFLICT(server_date) DO UPDATE SET
             conductor_discord_id = excluded.conductor_discord_id,
             vip_discord_id = excluded.vip_discord_id,
-            notified_at = excluded.notified_at
+            notified_at = excluded.notified_at,
+            conductor_prev_last_conducted_at = excluded.conductor_prev_last_conducted_at,
+            vip_prev_last_vip_at = excluded.vip_prev_last_vip_at
         """,
-        (server_date, conductor["discord_id"] if conductor else None, vip["discord_id"] if vip else None, ts),
+        (
+            server_date,
+            conductor["discord_id"] if conductor else None,
+            vip["discord_id"] if vip else None,
+            ts,
+            conductor["last_conducted_at"] if conductor else None,
+            vip["last_vip_at"] if vip else None,
+        ),
     )
     conn.commit()
     conn.close()
     return conductor, vip
 
 
-def record_manual_conductor(server_date: str, conductor_discord_id: str):
-    """Leadership manually /assign-conductor'd someone out of band. Locks the
-    day onto this pick without disturbing an existing VIP pick, and marks the
-    30-min reminder as already 'sent' since the assignment already happened live."""
+def override_conductor(server_date: str, discord_id: str, name: str, assigned_by: str):
+    """Leadership manually /assign-conductor's someone, replacing whoever (if
+    anyone) is currently credited for today. If that's a different person,
+    they never actually conducted, so their fairness credit is reverted back
+    to what it was before today's pick — they don't lose their place in line
+    for a turn they didn't get. Locks in the new pick, remembers ITS
+    pre-credit value too (so a later override can revert fairly again), and
+    marks the reminder as already 'sent' since the assignment just happened live."""
+    ensure_member(discord_id, name)
     ts = now_iso()
     conn = get_connection()
+
+    run = conn.execute("SELECT * FROM daily_run WHERE server_date = ?", (server_date,)).fetchone()
+    if run and run["conductor_discord_id"] and run["conductor_discord_id"] != discord_id:
+        conn.execute(
+            "UPDATE members SET last_conducted_at = ? WHERE discord_id = ?",
+            (run["conductor_prev_last_conducted_at"], run["conductor_discord_id"]),
+        )
+
+    prev_row = conn.execute("SELECT last_conducted_at FROM members WHERE discord_id = ?", (discord_id,)).fetchone()
+    prev_last_conducted_at = prev_row["last_conducted_at"] if prev_row else None
+
+    conn.execute("UPDATE members SET last_conducted_at = ? WHERE discord_id = ?", (ts, discord_id))
     conn.execute(
         """
-        INSERT INTO daily_run (server_date, conductor_discord_id, vip_discord_id, notified_at, reminder_sent_at)
-        VALUES (?, ?, NULL, ?, ?)
+        INSERT INTO daily_run (server_date, conductor_discord_id, vip_discord_id, notified_at, reminder_sent_at,
+                                conductor_prev_last_conducted_at)
+        VALUES (?, ?, NULL, ?, ?, ?)
         ON CONFLICT(server_date) DO UPDATE SET
             conductor_discord_id = excluded.conductor_discord_id,
             notified_at = excluded.notified_at,
-            reminder_sent_at = excluded.reminder_sent_at
+            reminder_sent_at = excluded.reminder_sent_at,
+            conductor_prev_last_conducted_at = excluded.conductor_prev_last_conducted_at
         """,
-        (server_date, conductor_discord_id, ts, ts),
+        (server_date, discord_id, ts, ts, prev_last_conducted_at),
     )
-    conn.commit()
-    conn.close()
-
-
-def record_manual_vip(server_date: str, vip_discord_id: str):
-    """Leadership manually /assign-vip'd someone out of band. Locks in the VIP
-    for today without disturbing an existing conductor pick."""
-    ts = now_iso()
-    conn = get_connection()
     conn.execute(
         """
-        INSERT INTO daily_run (server_date, conductor_discord_id, vip_discord_id, notified_at, reminder_sent_at)
-        VALUES (?, NULL, ?, ?, NULL)
-        ON CONFLICT(server_date) DO UPDATE SET
-            vip_discord_id = excluded.vip_discord_id
+        INSERT INTO assignment_log (discord_id, role, timestamp, assigned_by, is_backfill)
+        VALUES (?, 'conductor', ?, ?, 0)
         """,
-        (server_date, vip_discord_id, ts),
+        (discord_id, ts, assigned_by),
     )
     conn.commit()
     conn.close()
+
+
+def override_vip(server_date: str, discord_id: str, name: str, assigned_by: str):
+    """Same idea as override_conductor, for the VIP pick."""
+    ensure_member(discord_id, name)
+    ts = now_iso()
+    conn = get_connection()
+
+    run = conn.execute("SELECT * FROM daily_run WHERE server_date = ?", (server_date,)).fetchone()
+    if run and run["vip_discord_id"] and run["vip_discord_id"] != discord_id:
+        conn.execute(
+            "UPDATE members SET last_vip_at = ? WHERE discord_id = ?",
+            (run["vip_prev_last_vip_at"], run["vip_discord_id"]),
+        )
+
+    prev_row = conn.execute("SELECT last_vip_at FROM members WHERE discord_id = ?", (discord_id,)).fetchone()
+    prev_last_vip_at = prev_row["last_vip_at"] if prev_row else None
+
+    conn.execute("UPDATE members SET last_vip_at = ? WHERE discord_id = ?", (ts, discord_id))
+    conn.execute(
+        """
+        INSERT INTO daily_run (server_date, conductor_discord_id, vip_discord_id, notified_at, vip_prev_last_vip_at)
+        VALUES (?, NULL, ?, ?, ?)
+        ON CONFLICT(server_date) DO UPDATE SET
+            vip_discord_id = excluded.vip_discord_id,
+            vip_prev_last_vip_at = excluded.vip_prev_last_vip_at
+        """,
+        (server_date, discord_id, ts, prev_last_vip_at),
+    )
+    conn.execute(
+        """
+        INSERT INTO assignment_log (discord_id, role, timestamp, assigned_by, is_backfill)
+        VALUES (?, 'vip', ?, ?, 0)
+        """,
+        (discord_id, ts, assigned_by),
+    )
+    conn.commit()
+    conn.close()
+
+
+def undo_conductor(server_date: str):
+    """Corrects a case where whoever the bot credited as today's conductor
+    never actually went (e.g. someone outside the rotation ran it in-game
+    without leadership ever running /assign-conductor, so the bot had no way
+    to know). Reverts that person's fairness credit back to what it was
+    before today's pick and reopens today's conductor slot, WITHOUT picking
+    a replacement — unlike /skip-conductor, which assumes a real turn
+    happened and moves on. Returns the name of the person who got reverted,
+    or None if there was no conductor credited today to undo."""
+    run = get_todays_run(server_date)
+    if run is None or run["conductor_discord_id"] is None:
+        return None
+
+    conn = get_connection()
+    old_row = conn.execute(
+        "SELECT name FROM members WHERE discord_id = ?", (run["conductor_discord_id"],)
+    ).fetchone()
+    old_name = old_row["name"] if old_row else "someone"
+
+    conn.execute(
+        "UPDATE members SET last_conducted_at = ? WHERE discord_id = ?",
+        (run["conductor_prev_last_conducted_at"], run["conductor_discord_id"]),
+    )
+    conn.execute(
+        "UPDATE daily_run SET conductor_discord_id = NULL, remind_at = NULL, "
+        "reminder_sent_at = NULL, conductor_prev_last_conducted_at = NULL WHERE server_date = ?",
+        (server_date,),
+    )
+    conn.commit()
+    conn.close()
+    return old_name
+
+
+def undo_vip(server_date: str):
+    """Same idea as undo_conductor, for the VIP pick."""
+    run = get_todays_run(server_date)
+    if run is None or run["vip_discord_id"] is None:
+        return None
+
+    conn = get_connection()
+    old_row = conn.execute(
+        "SELECT name FROM members WHERE discord_id = ?", (run["vip_discord_id"],)
+    ).fetchone()
+    old_name = old_row["name"] if old_row else "someone"
+
+    conn.execute(
+        "UPDATE members SET last_vip_at = ? WHERE discord_id = ?",
+        (run["vip_prev_last_vip_at"], run["vip_discord_id"]),
+    )
+    conn.execute(
+        "UPDATE daily_run SET vip_discord_id = NULL, vip_prev_last_vip_at = NULL WHERE server_date = ?",
+        (server_date,),
+    )
+    conn.commit()
+    conn.close()
+    return old_name
 
 
 def mark_reminder_sent(server_date: str):
@@ -487,8 +616,9 @@ def skip_conductor(server_date: str):
         (ts, new_conductor["discord_id"]),
     )
     conn.execute(
-        "UPDATE daily_run SET conductor_discord_id = ?, reminder_sent_at = NULL WHERE server_date = ?",
-        (new_conductor["discord_id"], server_date),
+        "UPDATE daily_run SET conductor_discord_id = ?, reminder_sent_at = NULL, "
+        "conductor_prev_last_conducted_at = ? WHERE server_date = ?",
+        (new_conductor["discord_id"], new_conductor["last_conducted_at"], server_date),
     )
     conn.execute(
         """
@@ -530,8 +660,8 @@ def skip_vip(server_date: str):
         (ts, new_vip["discord_id"]),
     )
     conn.execute(
-        "UPDATE daily_run SET vip_discord_id = ? WHERE server_date = ?",
-        (new_vip["discord_id"], server_date),
+        "UPDATE daily_run SET vip_discord_id = ?, vip_prev_last_vip_at = ? WHERE server_date = ?",
+        (new_vip["discord_id"], new_vip["last_vip_at"], server_date),
     )
     conn.execute(
         """
@@ -552,54 +682,6 @@ def get_member_name(discord_id: str):
     ).fetchone()
     conn.close()
     return row
-
-
-# ---------- Assignment (live, starts countdown) ----------
-
-def assign_conductor(discord_id: str, name: str, assigned_by: str):
-    """Record this member as conductor for the current run. They stay on the
-    conductor list with their preferred time — it's a persistent rotation,
-    not a one-time queue, so no one needs to re-join after their turn."""
-    ensure_member(discord_id, name)
-    ts = now_iso()
-    conn = get_connection()
-    conn.execute(
-        "UPDATE members SET last_conducted_at = ? WHERE discord_id = ?",
-        (ts, discord_id),
-    )
-    conn.execute(
-        """
-        INSERT INTO assignment_log (discord_id, role, timestamp, assigned_by, is_backfill)
-        VALUES (?, 'conductor', ?, ?, 0)
-        """,
-        (discord_id, ts, assigned_by),
-    )
-    conn.commit()
-    conn.close()
-    return ts
-
-
-def assign_vip(discord_id: str, name: str, assigned_by: str):
-    """Record this member as VIP for the current run. They stay on the VIP
-    list — it's a persistent rotation, not a one-time queue, so no one needs
-    to re-join after their turn."""
-    ensure_member(discord_id, name)
-    ts = now_iso()
-    conn = get_connection()
-    conn.execute(
-        "UPDATE members SET last_vip_at = ? WHERE discord_id = ?",
-        (ts, discord_id),
-    )
-    conn.execute(
-        """
-        INSERT INTO assignment_log (discord_id, role, timestamp, assigned_by, is_backfill)
-        VALUES (?, 'vip', ?, ?, 0)
-        """,
-        (discord_id, ts, assigned_by),
-    )
-    conn.commit()
-    conn.close()
-    return ts
 
 
 # ---------- Backfill / manual history correction ----------

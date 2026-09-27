@@ -97,6 +97,8 @@ COMMANDS_TEXT = (
     "`/assign-vip @member` — manually assign the VIP, overriding today's pick\n"
     "`/skip-conductor` — today's conductor already had their turn; pick the next in rotation\n"
     "`/skip-vip` — today's VIP already had their turn; pick the next in rotation\n"
+    "`/undo-conductor` — today's conductor never actually went; undo their credit, no replacement\n"
+    "`/undo-vip` — today's VIP never actually had a turn; undo their credit, no replacement\n"
     "`/set-time @member time:HH:MM` — add a member to the conductor rotation, or change their time if they're already in it\n"
     "`/add-vip @member` — add a member to the VIP rotation\n"
     "`/add-all-to-vip` — add every server member to the VIP rotation at once\n"
@@ -558,9 +560,8 @@ async def view_vip_queue(interaction: discord.Interaction):
 @app_commands.describe(member="The member to assign as conductor")
 @is_leadership()
 async def assign_conductor(interaction: discord.Interaction, member: discord.Member):
-    db.assign_conductor(str(member.id), member.display_name, str(interaction.user.id))
     run_day = game_server_now().strftime("%Y-%m-%d")
-    db.record_manual_conductor(run_day, str(member.id))
+    db.override_conductor(run_day, str(member.id), member.display_name, str(interaction.user.id))
     intro = (
         f"🚂 **{member.display_name}** has been assigned as conductor — the countdown starts now!\n"
         f"{member.mention}, here's what to do:\n\n"
@@ -575,9 +576,8 @@ async def assign_conductor(interaction: discord.Interaction, member: discord.Mem
 @app_commands.describe(member="The member to assign as VIP")
 @is_leadership()
 async def assign_vip(interaction: discord.Interaction, member: discord.Member):
-    db.assign_vip(str(member.id), member.display_name, str(interaction.user.id))
     run_day = game_server_now().strftime("%Y-%m-%d")
-    db.record_manual_vip(run_day, str(member.id))
+    db.override_vip(run_day, str(member.id), member.display_name, str(interaction.user.id))
     await interaction.response.send_message(f"⭐ **{member.display_name}** has been assigned as VIP for this run.")
 
 
@@ -622,6 +622,34 @@ async def skip_vip_cmd(interaction: discord.Interaction):
     line = random.choice(SKIP_VIP_LINES).format(old=old_name)
     await interaction.response.send_message(
         f"{line}\n⭐ New VIP for today: **{new_vip['name']}**. Conductor stays the same."
+    )
+
+
+@bot.tree.command(name="undo-conductor", description="[Leadership] Today's conductor never actually went — undo their credit, no replacement.")
+@is_leadership()
+async def undo_conductor_cmd(interaction: discord.Interaction):
+    today_str = game_server_now().strftime("%Y-%m-%d")
+    old_name = db.undo_conductor(today_str)
+    if old_name is None:
+        await interaction.response.send_message("No conductor has been picked for today yet — nothing to undo.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"Reverted **{old_name}**'s credit — they're back to their normal place in the rotation. "
+        f"Today's conductor slot is now open; use `/assign-conductor` if you need to log who actually ran it.",
+    )
+
+
+@bot.tree.command(name="undo-vip", description="[Leadership] Today's VIP never actually had a turn — undo their credit, no replacement.")
+@is_leadership()
+async def undo_vip_cmd(interaction: discord.Interaction):
+    today_str = game_server_now().strftime("%Y-%m-%d")
+    old_name = db.undo_vip(today_str)
+    if old_name is None:
+        await interaction.response.send_message("No VIP has been picked for today yet — nothing to undo.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"Reverted **{old_name}**'s credit — they're back to their normal place in the rotation. "
+        f"Today's VIP slot is now open; use `/assign-vip` if you need to log who actually got it.",
     )
 
 

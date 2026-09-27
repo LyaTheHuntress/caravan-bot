@@ -92,7 +92,7 @@ COMMANDS_TEXT = (
     "`/assign-vip @member` — manually assign the VIP, overriding today's pick\n"
     "`/skip-conductor` — today's conductor already had their turn; pick the next in rotation\n"
     "`/skip-vip` — today's VIP already had their turn; pick the next in rotation\n"
-    "`/set-time @member time:HH:MM` — change a member's preferred conductor time\n"
+    "`/set-time @member time:HH:MM` — add a member to the conductor rotation, or change their time if they're already in it\n"
     "`/remove-from-queue @member` — remove someone else from the conductor rotation\n"
     "`/remove-from-vip-queue @member` — remove someone else from the VIP rotation\n"
     "`/remove-member @member` — remove someone from both rotations at once (e.g. they left the alliance)\n"
@@ -307,8 +307,8 @@ async def remove_from_queue(interaction: discord.Interaction, member: discord.Me
     await interaction.response.send_message(f"**{member.display_name}** has been removed from the conductor rotation.", ephemeral=True)
 
 
-@bot.tree.command(name="set-time", description="[Leadership] Change a member's preferred conductor time.")
-@app_commands.describe(member="The member whose time to change", time="Their new preferred server time, e.g. 19:00")
+@bot.tree.command(name="set-time", description="[Leadership] Set or change a member's preferred conductor time. Adds them to the rotation if they aren't in it yet.")
+@app_commands.describe(member="The member to add or update", time="Their preferred server time, e.g. 19:00")
 @is_leadership()
 async def set_time(interaction: discord.Interaction, member: discord.Member, time: str):
     if parse_hhmm(time) is None:
@@ -318,9 +318,9 @@ async def set_time(interaction: discord.Interaction, member: discord.Member, tim
         return
     changed = db.set_conductor_time(str(member.id), time)
     if not changed:
+        db.join_conductor_queue(str(member.id), member.display_name, time)
         await interaction.response.send_message(
-            f"**{member.display_name}** isn't currently in the conductor rotation, so there's no time to change. "
-            f"They'll need to run `/join-queue` themselves first.",
+            f"**{member.display_name}** has been added to the conductor rotation with preferred time **{time}**.",
             ephemeral=True,
         )
         return

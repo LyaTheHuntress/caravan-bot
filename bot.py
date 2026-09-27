@@ -307,7 +307,7 @@ async def remove_from_queue(interaction: discord.Interaction, member: discord.Me
     await interaction.response.send_message(f"**{member.display_name}** has been removed from the conductor rotation.", ephemeral=True)
 
 
-@bot.tree.command(name="set-time", description="[Leadership] Set or change a member's preferred conductor time. Adds them to the rotation if they aren't in it yet.")
+@bot.tree.command(name="set-time", description="[Leadership] Add/update a member's preferred conductor time.")
 @app_commands.describe(member="The member to add or update", time="Their preferred server time, e.g. 19:00")
 @is_leadership()
 async def set_time(interaction: discord.Interaction, member: discord.Member, time: str):

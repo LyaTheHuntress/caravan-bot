@@ -386,10 +386,14 @@ async def assign_conductor(interaction: discord.Interaction, member: discord.Mem
     db.assign_conductor(str(member.id), member.display_name, str(interaction.user.id))
     run_day = game_server_now().strftime("%Y-%m-%d")
     db.record_manual_conductor(run_day, str(member.id))
-    await interaction.response.send_message(
+    intro = (
         f"🚂 **{member.display_name}** has been assigned as conductor — the countdown starts now!\n"
-        f"{member.mention}, here's what to do:\n{HOW_TO_CONDUCT_TEXT}"
+        f"{member.mention}, here's what to do:\n\n"
     )
+    chunks = chunk_text(intro + HOW_TO_CONDUCT_TEXT)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
 
 
 @bot.tree.command(name="assign-vip", description="[Leadership] Manually assign the VIP, overriding today's pick.")

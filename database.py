@@ -122,12 +122,76 @@ def init_db():
         )
     """)
 
+    # A plain-English activity feed, visible to anyone via /logbook. Every
+    # meaningful action (joining/leaving a rotation, assignments, skips,
+    # undos, admin actions) gets one line here, newest first.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            actor_discord_id TEXT,
+            actor_name TEXT NOT NULL,
+            action TEXT NOT NULL
+        )
+    """)
+
+    # Small key/value store for settings leadership can toggle live from
+    # Discord (e.g. weekend pause), without needing server access. A .env
+    # value is still used as the starting default until someone toggles it
+    # here for the first time.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def log_activity(actor_discord_id: Optional[str], actor_name: str, action: str):
+    """Adds one line to the /logbook feed. actor_discord_id may be None for
+    system-driven events (e.g. the automatic daily pick)."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO activity_log (timestamp, actor_discord_id, actor_name, action) VALUES (?, ?, ?, ?)",
+        (now_iso(), actor_discord_id, actor_name, action),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key: str):
+    """Returns the stored string value for key, or None if it's never been set."""
+    conn = get_connection()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+
+def set_setting(key: str, value: str):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_activity(limit: int = 60):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT timestamp, actor_name, action FROM activity_log ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def ensure_member(discord_id: str, name: str):

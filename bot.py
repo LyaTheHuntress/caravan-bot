@@ -44,6 +44,25 @@ GAME_SERVER_UTC_OFFSET = float(os.getenv("GAME_SERVER_UTC_OFFSET", "0"))
 # (a channel, pinned message, spreadsheet, etc.). If set, it gets included in the
 # /ping-for-times DM so people don't have to go hunting for it.
 TIME_CONVERSION_CHART_URL = os.getenv("TIME_CONVERSION_CHART_URL", "")
+# Optional: skip the automatic daily pick (and reminder) on certain days of the
+# week, in SERVER time. Off by default. Leadership can flip this on/off live in
+# Discord with /toggle-weekend-pause -- this env var only supplies the STARTING
+# value the very first time the bot runs, before anyone has toggled it.
+# WEEKEND_DAYS decides which days count as "weekend" (comma separated full
+# weekday names, case-insensitive) and is still set here only, not toggleable.
+# Leadership can still use /assign-conductor or /assign-vip on a paused day if
+# they want to run one anyway.
+PAUSE_ON_WEEKENDS_DEFAULT = os.getenv("PAUSE_ON_WEEKENDS", "false").strip().lower() == "true"
+WEEKEND_DAYS = {d.strip().lower() for d in os.getenv("WEEKEND_DAYS", "Saturday,Sunday").split(",") if d.strip()}
+
+
+def is_weekend_pause_enabled() -> bool:
+    """The live setting, toggleable via /toggle-weekend-pause. Falls back to
+    the .env default until leadership has toggled it at least once."""
+    stored = db.get_setting("pause_on_weekends")
+    if stored is None:
+        return PAUSE_ON_WEEKENDS_DEFAULT
+    return stored == "true"
 
 HOW_TO_CONDUCT_TEXT = (
     "**How to conduct the caravan:**\n\n"
@@ -89,6 +108,7 @@ COMMANDS_TEXT = (
     "`/join-vip-queue` — join the VIP rotation\n"
     "`/leave-vip-queue` — remove yourself from the VIP rotation\n"
     "`/vip-queue` — view the VIP rotation, soonest-turn first\n"
+    "`/logbook` — see a plain-English log of recent bot activity\n"
     "`/history [member]` — view your history, someone else's, or the full roster if left blank\n"
     "`/how-to-conduct` — full instructions for running the caravan\n"
     "`/commands` — show this list\n\n"
@@ -103,6 +123,7 @@ COMMANDS_TEXT = (
     "`/add-vip @member` — add a member to the VIP rotation\n"
     "`/add-all-to-vip` — add every server member to the VIP rotation at once\n"
     "`/sync-names` — refresh everyone's stored name to their current server nickname\n"
+    "`/toggle-weekend-pause` — turn the automatic weekend pause on or off\n"
     "`/ping-for-times` — DM everyone not in the conductor rotation, asking for their time\n"
     "`/remove-from-queue @member` — remove someone else from the conductor rotation\n"
     "`/remove-from-vip-queue @member` — remove someone else from the VIP rotation\n"
@@ -208,7 +229,14 @@ async def daily_caravan_check():
     # Selection is pure fairness across the whole rotation — not tied to
     # anyone's individual preferred time. The preferred time only controls
     # when the later reminder ping goes out.
-    if current_time_str == "00:00" and db.get_todays_run(today_str) is None:
+    is_paused_today = is_weekend_pause_enabled() and server_now.strftime("%A").lower() in WEEKEND_DAYS
+    if current_time_str == "00:00" and is_paused_today:
+        await channel.send(
+            f"{role_mention} — no caravan today ({server_now.strftime('%A')} is a paused day). "
+            f"Leadership can still run `/assign-conductor` if you want to run one anyway."
+        )
+        db.log_activity(None, "Bot", f"Bot skipped today's pick — {server_now.strftime('%A')} is a paused day")
+    elif current_time_str == "00:00" and db.get_todays_run(today_str) is None:
         conductor, vip = db.start_daily_run(today_str)
         if conductor is None:
             await channel.send(
@@ -222,6 +250,8 @@ async def daily_caravan_check():
                 f"{role_mention} — today's conductor is {conductor_mention}, scheduled for "
                 f"**{conductor['preferred_time']}** server time. {vip_line}"
             )
+            vip_bit = f", VIP {vip['name']}" if vip else ""
+            db.log_activity(None, "Bot", f"Automatic daily pick: conductor {conductor['name']}{vip_bit}")
             # Compute the exact moment the 30-min reminder should fire. If that
             # moment has already passed — e.g. someone's preferred time is within
             # the first 30 minutes after midnight, so the window closed before
@@ -258,6 +288,7 @@ async def daily_caravan_check():
         f"**{conductor_entry['preferred_time']}** server time (starting in 30 minutes).\n{vip_line}"
     )
     db.mark_reminder_sent(today_str)
+    db.log_activity(None, "Bot", f"Bot sent 30-minute reminder for conductor {conductor_entry['name']}")
 
 
 @bot.event
@@ -278,6 +309,7 @@ async def on_member_remove(member: discord.Member):
     # leadership never has to manually edit the lists for that.
     db.leave_conductor_queue(str(member.id))
     db.leave_vip_queue(str(member.id))
+    db.log_activity(str(member.id), member.display_name, f"{member.display_name} left the server — removed from both rotations")
 
 
 @bot.event
@@ -287,6 +319,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     # for them to run another command for it to take effect.
     if before.display_name != after.display_name:
         db.ensure_member(str(after.id), after.display_name)
+        db.log_activity(None, "Bot", f"Bot updated stored name: {before.display_name} → {after.display_name}")
 
 
 @bot.event
@@ -295,13 +328,15 @@ async def on_member_join(member: discord.Member):
         return
     # VIP needs no time input, so new members go straight into that rotation.
     db.join_vip_queue(str(member.id), member.display_name)
+    db.log_activity(str(member.id), member.display_name, f"{member.display_name} joined the server — auto-added to VIP rotation")
     # Conductor needs their own preferred time, so this is an invite to
     # provide one (by DM reply or /join-queue), not an automatic add.
     try:
         await member.send(build_time_request_dm(welcome=True))
         db.mark_pending_onboarding(str(member.id))
+        db.log_activity(None, "Bot", f"Bot DM'd {member.display_name} a welcome message asking for their preferred time")
     except discord.Forbidden:
-        pass  # their DMs are closed to the bot; they can still self-join with /join-queue
+        db.log_activity(None, "Bot", f"Bot couldn't DM {member.display_name} a welcome message (their DMs are closed)")
 
 
 @bot.event
@@ -330,6 +365,7 @@ async def on_message(message: discord.Message):
 
     db.join_conductor_queue(discord_id, message.author.display_name, time_str)
     db.clear_pending_onboarding(discord_id)
+    db.log_activity(discord_id, message.author.display_name, f"{message.author.display_name} joined the conductor rotation via DM reply (time {time_str})")
     await message.channel.send(
         f"Got it — you're in the conductor rotation with preferred time **{time_str}**. Thanks!"
     )
@@ -350,6 +386,7 @@ async def join_queue(interaction: discord.Interaction, time: str):
         )
         return
     db.join_conductor_queue(str(interaction.user.id), interaction.user.display_name, time)
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} joined the conductor rotation (preferred time {time})")
     await interaction.response.send_message(
         f"You're in the conductor rotation, preferred time **{time}**.", ephemeral=True
     )
@@ -358,6 +395,7 @@ async def join_queue(interaction: discord.Interaction, time: str):
 @bot.tree.command(name="leave-queue", description="Remove yourself from the conductor rotation.")
 async def leave_queue(interaction: discord.Interaction):
     db.leave_conductor_queue(str(interaction.user.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} left the conductor rotation")
     await interaction.response.send_message("You've been removed from the conductor rotation.", ephemeral=True)
 
 
@@ -376,6 +414,7 @@ async def view_queue(interaction: discord.Interaction):
 @is_leadership()
 async def remove_from_queue(interaction: discord.Interaction, member: discord.Member):
     db.leave_conductor_queue(str(member.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} removed {member.display_name} from the conductor rotation")
     await interaction.response.send_message(f"**{member.display_name}** has been removed from the conductor rotation.", ephemeral=True)
 
 
@@ -391,11 +430,13 @@ async def set_time(interaction: discord.Interaction, member: discord.Member, tim
     changed = db.set_conductor_time(str(member.id), time)
     if not changed:
         db.join_conductor_queue(str(member.id), member.display_name, time)
+        db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} added {member.display_name} to the conductor rotation (time {time})")
         await interaction.response.send_message(
             f"**{member.display_name}** has been added to the conductor rotation with preferred time **{time}**.",
             ephemeral=True,
         )
         return
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} set {member.display_name}'s preferred time to {time}")
     await interaction.response.send_message(
         f"**{member.display_name}**'s preferred time is now **{time}**.", ephemeral=True
     )
@@ -408,6 +449,7 @@ async def set_time(interaction: discord.Interaction, member: discord.Member, tim
 @bot.tree.command(name="join-vip-queue", description="Join the VIP rotation.")
 async def join_vip_queue(interaction: discord.Interaction):
     db.join_vip_queue(str(interaction.user.id), interaction.user.display_name)
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} joined the VIP rotation")
     await interaction.response.send_message("You're in the VIP rotation.", ephemeral=True)
 
 
@@ -421,6 +463,7 @@ async def add_vip(interaction: discord.Interaction, member: discord.Member):
         )
         return
     db.join_vip_queue(str(member.id), member.display_name)
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} added {member.display_name} to the VIP rotation")
     await interaction.response.send_message(
         f"**{member.display_name}** has been added to the VIP rotation.", ephemeral=True
     )
@@ -444,6 +487,7 @@ async def add_all_to_vip(interaction: discord.Interaction):
         db.join_vip_queue(str(member.id), member.display_name)
         added += 1
 
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} bulk-added {added} member(s) to the VIP rotation")
     await interaction.followup.send(
         f"Added {added} member(s) to the VIP rotation. {already} were already in it.",
         ephemeral=True,
@@ -465,7 +509,19 @@ async def sync_names(interaction: discord.Interaction):
         db.ensure_member(str(member.id), member.display_name)
         updated += 1
 
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} refreshed names for {updated} member(s)")
     await interaction.followup.send(f"Refreshed names for {updated} member(s).", ephemeral=True)
+
+
+@bot.tree.command(name="toggle-weekend-pause", description="[Leadership] Turn the automatic weekend pause on or off.")
+@is_leadership()
+async def toggle_weekend_pause(interaction: discord.Interaction):
+    new_state = not is_weekend_pause_enabled()
+    db.set_setting("pause_on_weekends", "true" if new_state else "false")
+    days = ", ".join(d.capitalize() for d in sorted(WEEKEND_DAYS))
+    state_text = f"ON — no automatic pick on: {days}" if new_state else "OFF — picks happen every day as normal"
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} turned weekend pause {'ON' if new_state else 'OFF'}")
+    await interaction.response.send_message(f"Weekend pause is now **{state_text}**.")
 
 
 def build_time_request_dm(welcome: bool) -> str:
@@ -513,12 +569,18 @@ async def ping_for_times(interaction: discord.Interaction):
         shown = ", ".join(failed[:20])
         more = f", and {len(failed) - 20} more" if len(failed) > 20 else ""
         msg += f" Couldn't DM {len(failed)} (their DMs are likely closed to this bot): {shown}{more}"
+    db.log_activity(
+        str(interaction.user.id), interaction.user.display_name,
+        f"{interaction.user.display_name} pinged {len(sent)} member(s) for their preferred time"
+        + (f" ({len(failed)} couldn't be DM'd)" if failed else "")
+    )
     await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name="leave-vip-queue", description="Remove yourself from the VIP rotation.")
 async def leave_vip_queue(interaction: discord.Interaction):
     db.leave_vip_queue(str(interaction.user.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} left the VIP rotation")
     await interaction.response.send_message("You've been removed from the VIP rotation.", ephemeral=True)
 
 
@@ -527,6 +589,7 @@ async def leave_vip_queue(interaction: discord.Interaction):
 @is_leadership()
 async def remove_from_vip_queue(interaction: discord.Interaction, member: discord.Member):
     db.leave_vip_queue(str(member.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} removed {member.display_name} from the VIP rotation")
     await interaction.response.send_message(f"**{member.display_name}** has been removed from the VIP rotation.", ephemeral=True)
 
 
@@ -536,6 +599,7 @@ async def remove_from_vip_queue(interaction: discord.Interaction, member: discor
 async def remove_member(interaction: discord.Interaction, member: discord.Member):
     db.leave_conductor_queue(str(member.id))
     db.leave_vip_queue(str(member.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} removed {member.display_name} from both rotations")
     await interaction.response.send_message(
         f"**{member.display_name}** has been removed from both the conductor and VIP rotations.",
         ephemeral=True,
@@ -562,6 +626,7 @@ async def view_vip_queue(interaction: discord.Interaction):
 async def assign_conductor(interaction: discord.Interaction, member: discord.Member):
     run_day = game_server_now().strftime("%Y-%m-%d")
     db.override_conductor(run_day, str(member.id), member.display_name, str(interaction.user.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} assigned {member.display_name} as conductor for today")
     intro = (
         f"🚂 **{member.display_name}** has been assigned as conductor — the countdown starts now!\n"
         f"{member.mention}, here's what to do:\n\n"
@@ -578,6 +643,7 @@ async def assign_conductor(interaction: discord.Interaction, member: discord.Mem
 async def assign_vip(interaction: discord.Interaction, member: discord.Member):
     run_day = game_server_now().strftime("%Y-%m-%d")
     db.override_vip(run_day, str(member.id), member.display_name, str(interaction.user.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} assigned {member.display_name} as VIP for today")
     await interaction.response.send_message(f"⭐ **{member.display_name}** has been assigned as VIP for this run.")
 
 
@@ -598,6 +664,7 @@ async def skip_conductor_cmd(interaction: discord.Interaction):
     remind_at = compute_remind_at(game_server_now(), new_conductor["preferred_time"])
     if remind_at is not None:
         db.set_remind_at(today_str, remind_at.isoformat())
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} skipped {old_name} as conductor → {new_conductor['name']}")
     line = random.choice(SKIP_CONDUCTOR_LINES).format(old=old_name)
     await interaction.response.send_message(
         f"{line}\n🚂 New conductor for today: **{new_conductor['name']}**, scheduled for "
@@ -619,6 +686,7 @@ async def skip_vip_cmd(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} skipped {old_name} as VIP → {new_vip['name']}")
     line = random.choice(SKIP_VIP_LINES).format(old=old_name)
     await interaction.response.send_message(
         f"{line}\n⭐ New VIP for today: **{new_vip['name']}**. Conductor stays the same."
@@ -633,6 +701,7 @@ async def undo_conductor_cmd(interaction: discord.Interaction):
     if old_name is None:
         await interaction.response.send_message("No conductor has been picked for today yet — nothing to undo.", ephemeral=True)
         return
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} undid {old_name}'s conductor credit for today")
     await interaction.response.send_message(
         f"Reverted **{old_name}**'s credit — they're back to their normal place in the rotation. "
         f"Today's conductor slot is now open; use `/assign-conductor` if you need to log who actually ran it.",
@@ -647,6 +716,7 @@ async def undo_vip_cmd(interaction: discord.Interaction):
     if old_name is None:
         await interaction.response.send_message("No VIP has been picked for today yet — nothing to undo.", ephemeral=True)
         return
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} undid {old_name}'s VIP credit for today")
     await interaction.response.send_message(
         f"Reverted **{old_name}**'s credit — they're back to their normal place in the rotation. "
         f"Today's VIP slot is now open; use `/assign-vip` if you need to log who actually got it.",
@@ -666,6 +736,7 @@ async def log_conductor(interaction: discord.Interaction, member: discord.Member
         await interaction.response.send_message("Please use date format YYYY-MM-DD, e.g. 2026-09-01.", ephemeral=True)
         return
     db.log_conductor(str(member.id), member.display_name, date_iso, str(interaction.user.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} backfilled {member.display_name} as conductor on {date}")
     await interaction.response.send_message(
         f"Logged **{member.display_name}** as conductor on {date}. No countdown started.", ephemeral=True
     )
@@ -680,6 +751,7 @@ async def log_vip(interaction: discord.Interaction, member: discord.Member, date
         await interaction.response.send_message("Please use date format YYYY-MM-DD, e.g. 2026-09-01.", ephemeral=True)
         return
     db.log_vip(str(member.id), member.display_name, date_iso, str(interaction.user.id))
+    db.log_activity(str(interaction.user.id), interaction.user.display_name, f"{interaction.user.display_name} backfilled {member.display_name} as VIP on {date}")
     await interaction.response.send_message(
         f"Logged **{member.display_name}** as VIP on {date}.", ephemeral=True
     )
@@ -715,6 +787,26 @@ async def history(interaction: discord.Interaction, member: Optional[discord.Mem
         tag = " (backfilled)" if log["is_backfill"] else ""
         lines.append(f"• {log['role']} — {log['timestamp'][:10]}{tag}")
     await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(name="logbook", description="See a plain-English log of recent bot activity.")
+async def logbook(interaction: discord.Interaction):
+    rows = db.get_recent_activity(60)
+    if not rows:
+        await interaction.response.send_message("Nothing logged yet.")
+        return
+    lines = ["**Recent activity (newest first):**"]
+    for r in rows:
+        try:
+            dt = datetime.fromisoformat(r["timestamp"]) + timedelta(hours=GAME_SERVER_UTC_OFFSET)
+            stamp = dt.strftime("%m-%d %H:%M")
+        except ValueError:
+            stamp = r["timestamp"][:16]
+        lines.append(f"• `{stamp}` — {r['action']}")
+    chunks = chunk_text("\n".join(lines))
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
 
 
 # ---------------------------------------------------------------------------
